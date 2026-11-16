@@ -1,0 +1,47 @@
+services:
+  inst1:
+    build: .
+    image: scope-acq:latest
+    container_name: scope-inst1
+    command: ["python", "-m", "instrument.main", "inst1", "0.0.0.0", "5025"]
+    environment:
+      LOG_LEVEL: INFO
+    ports:
+      - "5025:5025"
+    restart: unless-stopped
+
+  inst2:
+    build: .
+    image: scope-acq:latest
+    container_name: scope-inst2
+    command: ["python", "-m", "instrument.main", "inst2", "0.0.0.0", "5025"]
+    environment:
+      LOG_LEVEL: INFO
+    ports:
+      - "5026:5025"
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: scope-acq:latest
+    container_name: scope-api
+    depends_on:
+      - inst1
+      - inst2
+    environment:
+      DB_PATH: /data/acquisitions.db
+      INST1_HOST: inst1
+      INST1_PORT: "5025"
+      INST2_HOST: inst2
+      INST2_PORT: "5025"
+      SCPI_COMMAND_TIMEOUT: "5"
+      RESTORE_ATTEMPTS: "3"
+      RESTORE_BACKOFF: "0.5"
+    volumes:
+      - api-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  api-data:
