@@ -35,6 +35,11 @@ class AcquisitionStatus(BaseModel):
     state: str
     previous_state: str | None
     restored: bool
+    # True while the instrument still awaits a confirmed restoration back to
+    # ``previous_state``.  Such a row may already be FAILED, but it must not be
+    # read as "instrument restored", and no later acquisition may touch the
+    # instrument until this clears.
+    restore_pending: bool = False
     error_code: str | None
     error_message: str | None
     created_at: str

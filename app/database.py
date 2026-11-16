@@ -3,6 +3,13 @@
 One row per acquisition.  The row is created in ``PENDING`` before any SCPI
 traffic starts, so an abrupt API restart can always find in-flight work, mark
 it failed and drive the instrument back to its pre-acquisition state.
+
+A second, per-instrument table stores the *restoration intent*: the run/stop
+state the instrument must be driven back to, plus whether it has been confirmed
+yet.  It is written before any restoration attempt and only cleared after a
+confirmed ``:RUN?`` read-back, which makes the target durable across process
+restarts and lets an offline instrument be recovered later without ever losing
+the original RUNNING/STOPPED goal.
 """
 
 from __future__ import annotations
@@ -38,6 +45,19 @@ CREATE TABLE IF NOT EXISTS acquisition (
 );
 CREATE INDEX IF NOT EXISTS idx_acq_state ON acquisition(state);
 CREATE INDEX IF NOT EXISTS idx_acq_instrument ON acquisition(instrument, id);
+
+CREATE TABLE IF NOT EXISTS instrument_recovery (
+    instrument       TEXT PRIMARY KEY,
+    target_state     TEXT NOT NULL,
+    pending          INTEGER NOT NULL DEFAULT 1,
+    acquisition_id   INTEGER,
+    error_code       TEXT,
+    error_message    TEXT,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_pending ON instrument_recovery(pending);
 """
 
 # Terminal / lifecycle states.
@@ -48,6 +68,7 @@ SUCCESS = "SUCCESS"
 FAILED = "FAILED"
 
 TERMINAL_STATES = (SUCCESS, FAILED)
+NON_TERMINAL_STATES = (PENDING, IN_PROGRESS, RESTORING)
 
 
 def utcnow() -> str:
@@ -125,6 +146,28 @@ async def mark_in_progress(conn: aiosqlite.Connection, acquisition_id: int, prev
     await update_state(conn, acquisition_id, IN_PROGRESS, previous_state=previous_state)
 
 
+async def mark_restoring(
+    conn: aiosqlite.Connection,
+    acquisition_id: int,
+    *,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Capture finished (successfully or not); instrument restore is in flight.
+
+    No waveform is persisted here.  Partial or complete samples are only
+    written once the instrument has been confirmed back in its prior state, so
+    a FAILED row can never serve a waveform.
+    """
+    await update_state(
+        conn,
+        acquisition_id,
+        RESTORING,
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+
 async def mark_success(
     conn: aiosqlite.Connection,
     acquisition_id: int,
@@ -137,11 +180,17 @@ async def mark_success(
     raw_codes: list[int],
     times: list[float],
     voltages: list[float],
+    restored: bool,
 ) -> None:
+    """Write the waveform and finalize as SUCCESS.
+
+    Only called after a confirmed restoration; ``restored`` stays false if the
+    caller could not confirm it (defensive, should not normally happen).
+    """
     await update_state(
         conn,
         acquisition_id,
-        RESTORING,
+        SUCCESS,
         point_count=point_count,
         x_origin=x_origin,
         x_increment=x_increment,
@@ -150,6 +199,7 @@ async def mark_success(
         raw_codes=json.dumps(raw_codes),
         times=json.dumps(times),
         voltages=json.dumps(voltages),
+        restored=1 if restored else 0,
     )
 
 
@@ -168,21 +218,56 @@ async def mark_failure(
     )
 
 
-async def mark_terminal(conn: aiosqlite.Connection, acquisition_id: int, state: str) -> None:
+async def mark_terminal(
+    conn: aiosqlite.Connection,
+    acquisition_id: int,
+    state: str,
+    *,
+    restored: bool,
+) -> None:
+    """Finalize an acquisition.
+
+    ``restored`` is explicit: a failed capture whose instrument could not be
+    confirmed back to its original state must stay ``restored=0`` (visible as
+    pending restoration) until a later recovery guarantees it.
+    """
     assert state in TERMINAL_STATES
-    await update_state(conn, acquisition_id, state, restored=1)
+    await update_state(conn, acquisition_id, state, restored=1 if restored else 0)
 
 
-async def mark_restart_failed(conn: aiosqlite.Connection, acquisition_id: int, message: str) -> None:
-    """Used at startup: the process died while this acquisition was active."""
+async def mark_restart_failed(
+    conn: aiosqlite.Connection,
+    acquisition_id: int,
+    message: str,
+    *,
+    restored: bool = False,
+) -> None:
+    """Used at startup: the process died while this acquisition was active.
+
+    ``restored`` is only true when the row provably never modified the
+    instrument (the pre-state was never read).  Otherwise the row stays
+    ``restored=0`` until the instrument-level recovery intent is confirmed.
+    """
     await update_state(
         conn,
         acquisition_id,
         FAILED,
         error_code="API_RESTARTED",
         error_message=message,
-        restored=0,
+        restored=1 if restored else 0,
     )
+
+
+async def set_restored(
+    conn: aiosqlite.Connection,
+    acquisition_id: int,
+    restored: bool,
+) -> None:
+    await conn.execute(
+        "UPDATE acquisition SET restored = ?, updated_at = ? WHERE id = ?",
+        (1 if restored else 0, utcnow(), acquisition_id),
+    )
+    await conn.commit()
 
 
 async def pending_acquisition_ids(conn: aiosqlite.Connection) -> list[int]:
@@ -192,6 +277,170 @@ async def pending_acquisition_ids(conn: aiosqlite.Connection) -> list[int]:
         WHERE state IN (?, ?, ?)
         ORDER BY id
         """,
-        (PENDING, IN_PROGRESS, RESTORING),
+        NON_TERMINAL_STATES,
     ) as cursor:
         return [int(row[0]) for row in await cursor.fetchall()]
+
+
+async def unrestored_acquisitions(conn: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    """Rows that still await a confirmed instrument restoration."""
+    async with conn.execute(
+        """
+        SELECT * FROM acquisition
+        WHERE restored = 0
+        ORDER BY id
+        """
+    ) as cursor:
+        return list(await cursor.fetchall())
+
+
+# --------------------------------------------------------------------------
+# Instrument restoration intents
+# --------------------------------------------------------------------------
+
+
+async def get_recovery(conn: aiosqlite.Connection, instrument: str) -> aiosqlite.Row | None:
+    async with conn.execute(
+        "SELECT * FROM instrument_recovery WHERE instrument = ?", (instrument,)
+    ) as cursor:
+        return await cursor.fetchone()
+
+
+async def pending_recoveries(conn: aiosqlite.Connection) -> list[aiosqlite.Row]:
+    async with conn.execute(
+        "SELECT * FROM instrument_recovery WHERE pending = 1 ORDER BY instrument"
+    ) as cursor:
+        return list(await cursor.fetchall())
+
+
+async def upsert_pending_recovery(
+    conn: aiosqlite.Connection,
+    instrument: str,
+    target_state: str,
+    *,
+    acquisition_id: int | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Persist the restoration goal before any attempt is made.
+
+    If an intent is already pending, its target is preserved.  A newer failure
+    must never overwrite the original RUNNING/STOPPED goal (acquisitions are
+    blocked while pending, so this is defensive).  ``attempts`` is retained
+    across updates so operators can see how long an instrument has been
+    waiting.
+    """
+    now = utcnow()
+    await conn.execute(
+        """
+        INSERT INTO instrument_recovery
+            (instrument, target_state, pending, acquisition_id,
+             error_code, error_message, attempts, created_at, updated_at)
+        VALUES (?, ?, 1, ?, ?, ?, 0, ?, ?)
+        ON CONFLICT(instrument) DO UPDATE SET
+            pending = 1,
+            target_state = CASE
+                WHEN instrument_recovery.pending = 1
+                THEN instrument_recovery.target_state
+                ELSE excluded.target_state
+            END,
+            acquisition_id = COALESCE(
+                excluded.acquisition_id, instrument_recovery.acquisition_id
+            ),
+            error_code = excluded.error_code,
+            error_message = excluded.error_message,
+            attempts = CASE
+                WHEN instrument_recovery.pending = 1
+                THEN instrument_recovery.attempts
+                ELSE 0
+            END,
+            created_at = CASE
+                WHEN instrument_recovery.pending = 1
+                THEN instrument_recovery.created_at
+                ELSE excluded.created_at
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (
+            instrument,
+            target_state,
+            acquisition_id,
+            error_code,
+            error_message,
+            now,
+            now,
+        ),
+    )
+    await conn.commit()
+
+
+async def record_recovery_attempt(
+    conn: aiosqlite.Connection,
+    instrument: str,
+    *,
+    error_code: str,
+    error_message: str,
+) -> None:
+    """Keep a pending intent pending and record the latest failed attempt."""
+    await conn.execute(
+        """
+        UPDATE instrument_recovery
+        SET pending = 1,
+            attempts = attempts + 1,
+            error_code = ?,
+            error_message = ?,
+            updated_at = ?
+        WHERE instrument = ?
+        """,
+        (error_code, error_message, utcnow(), instrument),
+    )
+    await conn.commit()
+
+
+async def clear_recovery(conn: aiosqlite.Connection, instrument: str) -> None:
+    """Mark the intent confirmed.  Only call after a read-back verification."""
+    await conn.execute(
+        """
+        UPDATE instrument_recovery
+        SET pending = 0,
+            error_code = NULL,
+            error_message = NULL,
+            updated_at = ?
+        WHERE instrument = ?
+        """,
+        (utcnow(), instrument),
+    )
+    await conn.commit()
+
+
+async def mark_instrument_rows_restored(
+    conn: aiosqlite.Connection,
+    instrument: str,
+) -> None:
+    """Flip acquisitions awaiting restoration once the instrument is confirmed.
+
+    Terminal rows whose restoration was pending become ``restored=1``.  A row
+    still in ``RESTORING`` can only belong to a process that died (or failed to
+    finalize) mid-restoration; it is finalized as FAILED with its restoration
+    now confirmed, and never exposes a waveform.  ``PENDING`` rows (queued
+    acquisitions that never touched the device) and already-successful
+    historical rows are untouched.
+    """
+    await conn.execute(
+        """
+        UPDATE acquisition
+        SET state = ?,
+            restored = 1,
+            error_code = COALESCE(error_code, 'RESTORE_INTERRUPTED'),
+            error_message = COALESCE(
+                error_message,
+                'restoration confirmed after the process stopped tracking this row'
+            ),
+            updated_at = ?
+        WHERE instrument = ?
+          AND restored = 0
+          AND state IN (?, ?, ?)
+        """,
+        (FAILED, utcnow(), instrument, FAILED, SUCCESS, RESTORING),
+    )
+    await conn.commit()

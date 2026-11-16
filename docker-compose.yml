@@ -37,6 +37,9 @@ services:
       SCPI_COMMAND_TIMEOUT: "5"
       RESTORE_ATTEMPTS: "3"
       RESTORE_BACKOFF: "0.5"
+      RECOVERY_RETRY_INTERVAL: "2.0"
+      RESTORE_SETTLE: "0.15"
+      SHUTDOWN_GRACE: "5.0"
     volumes:
       - api-data:/data
     ports:

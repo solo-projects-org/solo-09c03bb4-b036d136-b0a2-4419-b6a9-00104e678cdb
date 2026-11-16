@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -37,13 +38,20 @@ async def lifespan(app: FastAPI):
     global service, conn
     conn = await db.connect()
     service = AcquisitionService(conn, registry)
-    # Mark interrupted rows as failed and restore every affected instrument
-    # before the API starts accepting traffic.
+    # Mark interrupted rows as failed, persist each affected instrument's
+    # original run/stop target and schedule background restoration.  Only fast
+    # database work happens here, so an offline or slow instrument can never
+    # delay the API, its status endpoints or the other instrument.
     await service.startup_recovery()
-    LOG.info("startup recovery finished; API ready")
-    yield
-    if conn is not None:
-        await conn.close()
+    LOG.info("startup recovery scheduled; API ready")
+    try:
+        yield
+    finally:
+        if service is not None:
+            # Cancelled recoveries remain durable in SQLite for the next start.
+            await service.shutdown()
+        if conn is not None:
+            await conn.close()
 
 
 app = FastAPI(
@@ -84,6 +92,10 @@ def _row_to_status(row) -> AcquisitionStatus:
         state=row["state"],
         previous_state=row["previous_state"],
         restored=bool(row["restored"]),
+        restore_pending=(
+            row["state"] in (db.IN_PROGRESS, db.RESTORING)
+            or (row["state"] in db.TERMINAL_STATES and not row["restored"])
+        ),
         error_code=row["error_code"],
         error_message=row["error_message"],
         created_at=row["created_at"],
@@ -99,17 +111,30 @@ async def health() -> Health:
 
 @app.get("/instruments", response_model=list[InstrumentStatus], tags=["instruments"])
 async def list_instruments() -> list[InstrumentStatus]:
-    output: list[InstrumentStatus] = []
-    for name in registry.names:
+    async def probe(name: str) -> str | None:
         config = registry.config(name)
-        live_state: str | None = None
         # Read-only liveness probe; on failure we report null instead of 500.
+        # It is bounded well below the acquisition timeout so a slow or
+        # offline instrument cannot hold up status for the other one.
         try:
-            async with ScpiClient(config, settings.command_timeout) as client:
+            async with ScpiClient(
+                config,
+                min(settings.command_timeout, 1.0),
+                connect_timeout=1.0,
+            ) as client:
                 reply = await client.query_text(":RUN?")
-                live_state = "RUNNING" if reply == "1" else "STOPPED"
+                return "RUNNING" if reply == "1" else "STOPPED"
         except ScpiError as exc:
             LOG.info("liveness probe for %s failed: %s", name, exc)
+            return None
+
+    names = registry.names
+    # Probe concurrently: a single offline or slow instrument must not delay
+    # status for the others (or this endpoint).
+    live_states = await asyncio.gather(*(probe(name) for name in names))
+    output: list[InstrumentStatus] = []
+    for name, live_state in zip(names, live_states, strict=True):
+        config = registry.config(name)
         output.append(
             InstrumentStatus(
                 name=name,

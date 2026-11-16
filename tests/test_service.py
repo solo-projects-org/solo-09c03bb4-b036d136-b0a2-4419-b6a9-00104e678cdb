@@ -34,6 +34,8 @@ async def patched_service(two_simulators, tmp_path):
     settings.command_timeout = 3.0
     settings.restore_attempts = 3
     settings.restore_backoff = 0.05
+    settings.recovery_retry_interval = 0.1
+    settings.restore_settle = 0.0
     settings.instruments = configs
 
     connection = await db.connect()
@@ -121,16 +123,16 @@ async def test_stream_cut_fails_and_restores(patched_service):
 async def test_command_failure_restores_running(patched_service):
     service, sims, _ = patched_service
     inst = sims[0]["instrument"]
-    # Make only the second-and-later commands slow: a tiny initial delay keeps
-    # the first :RUN? inside the timeout so previous_state=RUNNING is recorded,
-    # then a dynamic delay pushes :STOP past the timeout.
+    # Slow only the third command: the first :RUN? and :STOP succeed, then a
+    # later preamble query times out.  The restore path must still detect the
+    # original RUNNING state and drive the instrument back to it.
     settings.command_timeout = 0.3
     call_count = {"n": 0}
     original_execute = type(inst)._execute
 
     async def flaky_execute(self, cmd):  # type: ignore[no-untyped-def]
         call_count["n"] += 1
-        if call_count["n"] >= 2:
+        if call_count["n"] == 3:
             await asyncio.sleep(0.6)
         return await original_execute(self, cmd)
 
@@ -144,14 +146,13 @@ async def test_command_failure_restores_running(patched_service):
 
     assert row["state"] == db.FAILED
     assert row["error_code"] == "TIMEOUT"
-    assert row["restored"] == 1
     assert row["previous_state"] == "RUNNING"
     assert row["raw_codes"] is None  # no partial waveform
     assert await _run_state(sims[0]) == "1"
 
 
 @pytest.mark.asyncio
-async def test_slow_response_times_out_and_restores(patched_service):
+async def test_slow_response_times_out_without_touching_instrument(patched_service):
     service, sims, _ = patched_service
     inst = sims[0]["instrument"]
     inst.state.delay = 0.6  # exceeds the 0.3s per-command timeout
@@ -162,12 +163,13 @@ async def test_slow_response_times_out_and_restores(patched_service):
 
     assert row["state"] == db.FAILED
     assert row["error_code"] == "TIMEOUT"
+    # The pre-state could never be read, so no state-changing command was sent:
+    # the still-running instrument was not paused and needs no restoration.
+    assert row["previous_state"] is None
     assert row["restored"] == 1
-    # Restore attempts were bounded; after clearing the delay, instrument is
-    # reachable again and (unknown prior state) safely stays STOPPED.
     inst.state.delay = 0.0
     settings.command_timeout = 3.0
-    assert await _run_state(sims[0]) == "0"
+    assert await _run_state(sims[0]) == "1"
 
 
 @pytest.mark.asyncio

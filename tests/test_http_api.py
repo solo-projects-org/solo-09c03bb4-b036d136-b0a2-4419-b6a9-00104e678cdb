@@ -31,6 +31,8 @@ async def client(two_simulators, tmp_path):
     settings.command_timeout = 3.0
     settings.restore_attempts = 3
     settings.restore_backoff = 0.05
+    settings.recovery_retry_interval = 0.1
+    settings.restore_settle = 0.0
     settings.instruments = configs
 
     connection = await db.connect()
@@ -134,3 +136,109 @@ async def test_concurrent_requests_same_instrument(client):
     assert len(set(ids)) == 4
     bodies = [await _wait_state(http, acquisition_id, {"SUCCESS"}) for acquisition_id in ids]
     assert all(body["state"] == "SUCCESS" for body in bodies)
+
+
+@pytest.mark.asyncio
+async def test_pending_restore_blocks_only_that_instrument_over_http(client):
+    http, _, sims = client
+    inst1 = sims[0]["instrument"]
+
+    # Refuse every run/stop state command from now on: the capture fails, and
+    # restoration to the recorded RUNNING target can never be confirmed.
+    original_submit = inst1.submit
+    blocked = {"on": True}
+
+    def submit(line, writer):
+        if blocked["on"] and line.strip().upper() in (":RUN", ":STOP"):
+            try:
+                writer.close()
+            except RuntimeError:
+                pass
+            return
+        original_submit(line, writer)
+
+    inst1.submit = submit  # type: ignore[method-assign]
+    try:
+        response = await http.post("/instruments/inst1/acquisitions", json={"channel": 1})
+        assert response.status_code == 202
+        failed_id = response.json()["acquisition_id"]
+        body = await _wait_state(http, failed_id, {"FAILED"})
+        assert body["restored"] is False
+        assert body["restore_pending"] is True
+        assert body["previous_state"] == "RUNNING"
+        assert body["result"] is None
+        assert body["error_code"] in {"SCPIPROTOCOLERROR", "SCPITIMEOUTERROR", "TIMEOUT"}
+
+        # No waveform for the failed row, and no silent success.
+        result = await http.get(f"/acquisitions/{failed_id}/result")
+        assert result.status_code == 409
+
+        # A later acquisition must be accepted but must not touch inst1.
+        queued = await http.post("/instruments/inst1/acquisitions", json={"channel": 1})
+        assert queued.status_code == 202
+        queued_id = queued.json()["acquisition_id"]
+        await asyncio.sleep(0.2)
+        pending = (await http.get(f"/acquisitions/{queued_id}")).json()
+        assert pending["state"] == "PENDING"
+
+        # Status remains available and the other instrument is fully usable.
+        statuses = {item["name"]: item for item in (await http.get("/instruments")).json()}
+        assert statuses["inst1"]["gate_open"] is False
+        assert statuses["inst1"]["last_restore"]["pending_restore"] is True
+        assert statuses["inst2"]["gate_open"] is True
+
+        other = await http.post("/instruments/inst2/acquisitions", json={"channel": 1})
+        other_id = other.json()["acquisition_id"]
+        other_body = await _wait_state(http, other_id, {"SUCCESS", "FAILED"})
+        assert other_body["state"] == "SUCCESS"
+    finally:
+        blocked["on"] = False
+        inst1.submit = original_submit  # type: ignore[method-assign]
+
+    # Automatic hand-off: the original RUNNING target is restored, the failed
+    # row flips to restored, the gate opens, and the queued acquisition runs.
+    restored = await _wait_field(http, failed_id, "restored", True)
+    assert restored["state"] == "FAILED"
+    assert restored["restore_pending"] is False
+
+    queued_body = await _wait_state(http, queued_id, {"SUCCESS", "FAILED"})
+    assert queued_body["state"] == "SUCCESS"
+    assert queued_body["restored"] is True
+    assert queued_body["previous_state"] == "RUNNING"
+
+
+async def _wait_field(http: AsyncClient, acquisition_id: int, field: str, value):
+    for _ in range(300):
+        body = (await http.get(f"/acquisitions/{acquisition_id}")).json()
+        if body[field] == value:
+            return body
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{field} never became {value!r}")
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_survives_offline_instrument(client):
+    http, _, sims = client
+    # Point inst1 at a closed port; status must not wait for it or fail.
+    from app.scpi import ScpiClient as _Client  # noqa: F401  (import sanity)
+
+    dead_port = 1  # connection refused immediately
+    registry._configs["inst1"] = InstrumentConfig(  # noqa: SLF001
+        "inst1", "127.0.0.1", dead_port
+    )
+    started = asyncio.get_running_loop().time()
+    response = await http.get("/instruments")
+    elapsed = asyncio.get_running_loop().time() - started
+    assert response.status_code == 200
+    assert elapsed < 2.0
+    statuses = {item["name"]: item for item in response.json()}
+    assert statuses["inst1"]["live_run_state"] is None
+    assert statuses["inst2"]["live_run_state"] == "RUNNING"
+
+    # Health and acquisition status queries are unaffected as well.
+    assert (await http.get("/health")).status_code == 200
+    assert (await http.get("/acquisitions")).status_code == 200
+    # inst2 still captures normally while inst1 is unreachable.
+    response = await http.post("/instruments/inst2/acquisitions", json={"channel": 1})
+    body = await _wait_state(http, response.json()["acquisition_id"], {"SUCCESS", "FAILED"})
+    assert body["state"] == "SUCCESS"

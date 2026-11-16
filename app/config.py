@@ -32,8 +32,20 @@ class Settings:
         self.command_timeout: float = float(os.environ.get("SCPI_COMMAND_TIMEOUT", "5.0"))
         self.restore_attempts: int = int(os.environ.get("RESTORE_ATTEMPTS", "3"))
         self.restore_backoff: float = float(os.environ.get("RESTORE_BACKOFF", "0.5"))
-        self.startup_recovery_attempts: int = int(os.environ.get("STARTUP_RECOVERY_ATTEMPTS", "10"))
-        self.startup_recovery_backoff: float = float(os.environ.get("STARTUP_RECOVERY_BACKOFF", "2.0"))
+        # Delay between background restoration cycles for an instrument whose
+        # recovery is still unconfirmed (offline or repeatedly dropping).
+        self.recovery_retry_interval: float = float(
+            os.environ.get("RECOVERY_RETRY_INTERVAL", "1.0")
+        )
+        # After a state command is acknowledged, wait this long and read the
+        # state again on a fresh connection.  This catches a command that was
+        # already received by the instrument on a dropped connection and only
+        # executes after the first confirmation (late execution must not be
+        # reported as a completed restoration).
+        self.restore_settle: float = float(os.environ.get("RESTORE_SETTLE", "0.15"))
+        # Grace period on shutdown for an in-flight acquisition to finish and
+        # confirm its restoration before the event loop tears down.
+        self.shutdown_grace: float = float(os.environ.get("SHUTDOWN_GRACE", "5.0"))
         self.instruments: tuple[InstrumentConfig, ...] = _default_instruments()
 
     def instrument(self, name: str) -> InstrumentConfig | None:
